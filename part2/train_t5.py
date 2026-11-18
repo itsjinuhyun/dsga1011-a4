@@ -9,11 +9,27 @@ import wandb
 
 from t5_utils import initialize_model, initialize_optimizer_and_scheduler, save_model, load_model_from_checkpoint, setup_wandb
 from transformers import GenerationConfig
-from load_data import load_t5_data
+from load_data import load_t5_data, postprocess_sql
+from transformers import T5TokenizerFast
 from utils import compute_metrics, save_queries_and_records
 
 DEVICE = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
 PAD_IDX = 0
+TOKENIZER = T5TokenizerFast.from_pretrained('google-t5/t5-small')
+MAX_GEN_LEN = 512
+
+
+def generate_sql(model, encoder_input, encoder_mask, initial_decoder_inputs):
+    '''Greedy decoding, starting from the BOS token, then turn token ids back into SQL text.'''
+    outputs = model.generate(
+        input_ids=encoder_input,
+        attention_mask=encoder_mask,
+        decoder_input_ids=initial_decoder_inputs,
+        max_new_tokens=MAX_GEN_LEN,
+        num_beams=1,
+    )
+    texts = TOKENIZER.batch_decode(outputs, skip_special_tokens=True, clean_up_tokenization_spaces=False)
+    return [postprocess_sql(t.strip()) for t in texts]
 
 def get_args():
     '''
@@ -138,16 +154,50 @@ def eval_epoch(args, model, dev_loader, gt_sql_pth, model_sql_path, gt_record_pa
     should both provide good results. If you find that this component of evaluation takes too long with your compute,
     we found the cross-entropy loss (in the evaluation set) to be well (albeit imperfectly) correlated with F1 performance.
     '''
-    # TODO
     model.eval()
-    return 0, 0, 0, 0, 0
+    criterion = nn.CrossEntropyLoss()
+    total_loss, total_tokens = 0, 0
+    sql_queries = []
+
+    with torch.no_grad():
+        for encoder_input, encoder_mask, decoder_input, decoder_targets, initial_decoder_inputs in tqdm(dev_loader):
+            encoder_input = encoder_input.to(DEVICE)
+            encoder_mask = encoder_mask.to(DEVICE)
+            decoder_input = decoder_input.to(DEVICE)
+            decoder_targets = decoder_targets.to(DEVICE)
+            initial_decoder_inputs = initial_decoder_inputs.to(DEVICE)
+
+            # 1) Loss with teacher forcing, same as training
+            logits = model(input_ids=encoder_input, attention_mask=encoder_mask,
+                           decoder_input_ids=decoder_input)['logits']
+            non_pad = decoder_targets != PAD_IDX
+            loss = criterion(logits[non_pad], decoder_targets[non_pad])
+            num_tokens = torch.sum(non_pad).item()
+            total_loss += loss.item() * num_tokens
+            total_tokens += num_tokens
+
+            # 2) Generate SQL from scratch
+            sql_queries += generate_sql(model, encoder_input, encoder_mask, initial_decoder_inputs)
+
+    # 3) Run the SQL on the database and score it
+    save_queries_and_records(sql_queries, model_sql_path, model_record_path)
+    sql_em, record_em, record_f1, error_msgs = compute_metrics(gt_sql_pth, model_sql_path,
+                                                               gt_record_path, model_record_path)
+    error_rate = sum(1 for m in error_msgs if m) / len(error_msgs)
+    return total_loss / total_tokens, record_f1, record_em, sql_em, error_rate
         
 def test_inference(args, model, test_loader, model_sql_path, model_record_path):
     '''
     You must implement inference to compute your model's generated SQL queries and its associated 
     database records. Implementation should be very similar to eval_epoch.
     '''
-    pass
+    model.eval()
+    sql_queries = []
+    with torch.no_grad():
+        for encoder_input, encoder_mask, initial_decoder_inputs in tqdm(test_loader):
+            sql_queries += generate_sql(model, encoder_input.to(DEVICE), encoder_mask.to(DEVICE),
+                                        initial_decoder_inputs.to(DEVICE))
+    save_queries_and_records(sql_queries, model_sql_path, model_record_path)
 
 def main():
     # Get key arguments

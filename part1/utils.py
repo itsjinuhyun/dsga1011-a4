@@ -44,7 +44,20 @@ def custom_transform(example):
 
     # You should update example["text"] using your transformation
 
-    raise NotImplementedError
+    neighbors = {
+        "q": "wa", "w": "qes", "e": "wrd", "r": "etf", "t": "ryg", "y": "tuh", "u": "yij", "i": "uok",
+        "o": "ipl", "p": "ol", "a": "qsz", "s": "awdz", "d": "sefx", "f": "drgc", "g": "fthv",
+        "h": "gyjb", "j": "hukn", "k": "jilm", "l": "kop", "z": "asx", "x": "zsdc", "c": "xdfv",
+        "v": "cfgb", "b": "vghn", "n": "bhjm", "m": "njk",
+    }
+    words = word_tokenize(example["text"])
+    for i, word in enumerate(words):
+        if len(word) >= 3 and word.isalpha() and random.random() < 0.3:
+            pos = random.randrange(len(word))
+            ch = word[pos].lower()
+            if ch in neighbors:
+                words[i] = word[:pos] + random.choice(neighbors[ch]) + word[pos + 1:]
+    example["text"] = TreebankWordDetokenizer().detokenize(words)
 
     ##### YOUR CODE ENDS HERE ######
 
